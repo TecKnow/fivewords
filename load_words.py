@@ -1,13 +1,16 @@
 import logging
 from pathlib import Path
 from collections import defaultdict
-from typing import Mapping, Optional, TypeAlias, TypeVar, Any
+from typing import Mapping, Optional, TypeAlias, TypeVar, Any, Callable, ParamSpec, Concatenate, Iterable
 import requests
 import shelve
+from shelve import Shelf
 from itertools import product
 from concurrent.futures import ProcessPoolExecutor
 from multiprocessing import cpu_count
 from datetime import datetime, timedelta
+import functools
+from time import perf_counter_ns
 
 logger = logging.getLogger(__name__)
 
@@ -25,37 +28,70 @@ WORDLE_ALLOWED_GUESSES_URL = (f"https://gist.githubusercontent.com"
                               f"/cdcdf777450c5b5301e439061d29694c/raw/b8375870720504ecf89c1970ea4532454f12de94"
                               f"/wordle-allowed-guesses.txt")
 
+P = ParamSpec('P')
+R = TypeVar('R')
 
-def make_anagram_map(word_set: frozenset[str]) -> dict[frozenset[str], frozenset[str]]:
-    working_result = defaultdict(set)
-    for word in word_set:
+
+def _load_or_calculate(func: Callable[P, R]) -> Callable[Concatenate[str, Shelf, bool, P], R]:
+    decorator_logger = logger.getChild(_load_or_calculate.__name__)
+
+    @functools.wraps(func)
+    def wrapper(value_name: str, shelf: Shelf, force: bool = False, *args: P.args, **kwargs: P.kwargs) -> R:
+        wrapper_logger = decorator_logger.getChild(wrapper.__name__)
+        if (not_found := (value_name not in shelf)) or force:
+            if not_found:
+                wrapper_logger.info(f"cached value for {value_name} not found.  Computing/retrieving.")
+            elif force:
+                wrapper_logger.info(f"Disregarding cached value for {value_name}.  Computing/retrieving.")
+            times_value = f"{value_name}_times"
+            start_time = perf_counter_ns()
+            shelf[value_name] = func(*args, **kwargs)
+            end_time = perf_counter_ns()
+            elapsed_time = end_time - start_time
+            shelf[times_value] = shelf.get(times_value, list()) + [elapsed_time]
+            wrapper_logger.info(f"{value_name} computed/retrieved in {elapsed_time} ms")
+        return shelf[value_name]
+
+    return wrapper
+
+
+@_load_or_calculate
+def _load_wordlist_url(url: str) -> frozenset[str]:
+    return frozenset((word.strip().casefold() for word in requests.get(url).text.splitlines()))
+
+
+@_load_or_calculate
+def _all_word_set(*word_sources: Iterable[str], ) -> frozenset[str]:
+    res = set()
+    res.update(*word_sources)
+    return frozenset(res)
+
+
+@_load_or_calculate
+def _heterogram_set(all_words: Iterable[str]) -> frozenset[str]:
+    return frozenset((word for word in all_words if len(word) == len(frozenset(word))))
+
+
+@_load_or_calculate
+def _anagram_map(heterogram_words: Iterable[str]) -> Anagram_Map[str]:
+    working_result: defaultdict[frozenset[str], set[str]] = defaultdict(set)
+    for word in heterogram_words:
         working_result[frozenset(word)].add(word)
-    working_result = {k: frozenset(v) for k, v in working_result.items()}
-    return working_result
+    frozen_result = {k: frozenset(v) for k, v in working_result.items()}
+    return frozen_result
 
 
 def load_or_fetch_initial_data(shelf_path: Path = SHELF_PATH, answer_url: str = WORDLE_ANSWERS_URL,
-                               guess_url: str = WORDLE_ALLOWED_GUESSES_URL) -> tuple[frozenset[str], Anagram_Map]:
+                               guess_url: str = WORDLE_ALLOWED_GUESSES_URL, force: bool = False) -> tuple[
+        frozenset[str], Anagram_Map[str]]:
     shelf_path.parent.mkdir(parents=True, exist_ok=True)
     with shelve.open(str(shelf_path)) as shelf:
-        if "all_word_set" not in shelf:
-            answers = frozenset((word.strip().casefold() for word in requests.get(answer_url).text.splitlines()))
-            guesses = frozenset((word.strip().casefold() for word in requests.get(guess_url).text.splitlines()))
-            shelf["all_word_set"] = frozenset(answers.union(guesses))
-        all_word_set = shelf["all_word_set"]
-        if not isinstance(all_word_set, frozenset):
-            raise TypeError(f"all_word_set stored in shelf is of incorrect type: {type(all_word_set)}")
-        if "heterogram_word_set" not in shelf:
-            shelf["heterogram_word_set"] = frozenset((word for word in all_word_set if len(set(word)) == len(word)))
-        heterogram_word_set = shelf["heterogram_word_set"]
-        if not isinstance(heterogram_word_set, frozenset):
-            raise ValueError(f"heterogram_word_set stored in shelf is of incorrect type: {type(heterogram_word_set)}")
-        if "anagram_map" not in shelf:
-            shelf["anagram_map"] = make_anagram_map(heterogram_word_set)
-        anagram_map = shelf["anagram_map"]
-        if not isinstance(anagram_map, Mapping):
-            raise TypeError(f"anagram_map stored in shelf is of incorrect type: {type(anagram_map)}")
-        return heterogram_word_set, anagram_map
+        answer_words = _load_wordlist_url("answer_words", shelf, force, answer_url)
+        guess_words = _load_wordlist_url("allowed_guess_words", shelf, force, guess_url)
+        all_words = _all_word_set("all_words_set", shelf, force, answer_words, guess_words)
+        heterogram_words = _heterogram_set("heterogram_set", shelf, force, all_words)
+        anagram_map = _anagram_map("anagram_map", shelf, force, heterogram_words)
+        return heterogram_words, anagram_map
 
 
 def _thread_init(anagram_map: Anagram_Map) -> None:
@@ -63,8 +99,9 @@ def _thread_init(anagram_map: Anagram_Map) -> None:
     global_anagram_map = anagram_map
 
 
-def _double_words_map_func(item: tuple[frozenset[str], frozenset[str]]) -> dict[
-        frozenset[str], frozenset[frozenset[str]]]:
+def _two_word_map_func(
+        item: tuple[frozenset[str], frozenset[str]]) -> dict[
+            frozenset[str], frozenset[frozenset[str]]]:
     set_1, words_1 = item
     single_word_working_result = defaultdict(set)
     for set_2, words_2 in global_anagram_map.items():
@@ -73,22 +110,25 @@ def _double_words_map_func(item: tuple[frozenset[str], frozenset[str]]) -> dict[
     return {k: frozenset(v) for k, v in single_word_working_result.items()}
 
 
-def compute_double_words(anagram_map: Mapping[frozenset[str], frozenset[str]]) -> tuple[Mapping[
-        frozenset[str], frozenset[frozenset[str]]], timedelta]:
+def compute_two_word_sets(anagram_map: Mapping[frozenset[str], frozenset[str]]) -> tuple[Mapping[
+                                                                                             frozenset[str], frozenset[
+                                                                                                 frozenset[
+                                                                                                     str]]], timedelta]:
     start_time = datetime.now()
     with ProcessPoolExecutor(initializer=_thread_init, initargs=(anagram_map,)) as executor:
         working_result = defaultdict(set)
-        for update_list in executor.map(_double_words_map_func, anagram_map.items(),
+        for update_list in executor.map(_two_word_map_func, anagram_map.items(),
                                         chunksize=(len(anagram_map) // cpu_count() + 1)):
             for k, v in update_list.items():
                 working_result[k].update(v)
         working_result = {k: frozenset(v) for k, v in working_result.items()}
         end_time = datetime.now()
-        return working_result, end_time-start_time
+        return working_result, end_time - start_time
 
 
-def compute_quadruple_words(double_word_map: Mapping[frozenset[str], frozenset[frozenset[str]]]) -> Mapping[
-        frozenset[str], frozenset[frozenset[str]]]:
+def compute_quadruple_words(
+        double_word_map: Mapping[frozenset[str], frozenset[frozenset[str]]]) -> Mapping[
+            frozenset[str], frozenset[frozenset[str]]]:
     working_result = defaultdict(set)
     for ((set_1, words_1), (set_2, words_2)) in product(double_word_map.items(), repeat=2):
         set_1: frozenset[str]
@@ -105,11 +145,4 @@ def compute_quadruple_words(double_word_map: Mapping[frozenset[str], frozenset[f
 if __name__ == "__main__":
     logging.basicConfig(level=logging.DEBUG)
     words, anagrams = load_or_fetch_initial_data()
-    double_words = compute_double_words(anagrams)
-    logger.debug(
-        len(double_words))  # quadruple_words = compute_quadruple_words(double_words)  # print(len(quadruple_words))
-    # from pprint import pprint
-    # from itertools import islice
-    # for x in islice(double_words.items(), 0, 10):
-    #     pprint(x)
-    #     print()
+    print(len(anagrams))
