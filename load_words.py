@@ -1,16 +1,18 @@
-import logging
-from pathlib import Path
-from collections import defaultdict
-from typing import Mapping, Optional, TypeAlias, TypeVar, Any, Callable, ParamSpec, Concatenate, Iterable
-import requests
-import shelve
-from shelve import Shelf
-from itertools import product
-from concurrent.futures import ProcessPoolExecutor
-from multiprocessing import cpu_count
-from datetime import datetime, timedelta
 import functools
+import logging
+import os
+import shelve
+from collections import defaultdict
+from concurrent.futures import ProcessPoolExecutor
+from datetime import datetime, timedelta
+from itertools import product
+from multiprocessing import cpu_count
+from pathlib import Path
+from shelve import Shelf
 from time import perf_counter_ns
+from typing import Mapping, Optional, TypeAlias, TypeVar, Any, Callable, ParamSpec, Iterable
+
+import requests
 
 logger = logging.getLogger(__name__)
 
@@ -32,66 +34,88 @@ P = ParamSpec('P')
 R = TypeVar('R')
 
 
-def _load_or_calculate(func: Callable[P, R]) -> Callable[Concatenate[str, Shelf, bool, P], R]:
-    decorator_logger = logger.getChild(_load_or_calculate.__name__)
+class FiveWords:
+    def _load_or_calculate(self, func: Callable[P, R]) -> Callable[..., R]:
+        decorator_logger = logger.getChild(self.__class__._load_or_calculate.__name__)
 
-    @functools.wraps(func)
-    def wrapper(value_name: str, shelf: Shelf, force: bool = False, *args: P.args, **kwargs: P.kwargs) -> R:
-        wrapper_logger = decorator_logger.getChild(wrapper.__name__)
-        if (not_found := (value_name not in shelf)) or force:
-            if not_found:
-                wrapper_logger.info(f"cached value for {value_name} not found.  Computing/retrieving.")
-            elif force:
-                wrapper_logger.info(f"Disregarding cached value for {value_name}.  Computing/retrieving.")
-            times_value = f"{value_name}_times"
-            start_time = perf_counter_ns()
-            shelf[value_name] = func(*args, **kwargs)
-            end_time = perf_counter_ns()
-            elapsed_time = end_time - start_time
-            shelf[times_value] = shelf.get(times_value, list()) + [elapsed_time]
-            wrapper_logger.info(f"{value_name} computed/retrieved in {elapsed_time} ms")
-        return shelf[value_name]
+        @functools.wraps(func)
+        def wrapper(value_name: str, shelf: Shelf, force: bool = False, *args: P.args, **kwargs: P.kwargs) -> R:
+            wrapper_logger = decorator_logger.getChild(wrapper.__name__)
+            if (not_found := (value_name not in shelf)) or force:
+                if not_found:
+                    wrapper_logger.info(f"cached value for {value_name} not found.  Computing/retrieving.")
+                elif force:
+                    wrapper_logger.info(f"Disregarding cached value for {value_name}.  Computing/retrieving.")
+                times_value = f"{value_name}_times"
+                start_time = perf_counter_ns()
+                shelf[value_name] = func(*args, **kwargs)
+                end_time = perf_counter_ns()
+                elapsed_time = end_time - start_time
+                shelf[times_value] = shelf.get(times_value, list()) + [elapsed_time]
+                wrapper_logger.info(f"{value_name} computed/retrieved in {elapsed_time} ns")
+            return shelf[value_name]
 
-    return wrapper
+        return wrapper
 
+    @staticmethod
+    @_load_or_calculate
+    def _load_wordlist_url(url: str) -> frozenset[str]:
+        return frozenset((word.strip().casefold() for word in requests.get(url).text.splitlines()))
 
-@_load_or_calculate
-def _load_wordlist_url(url: str) -> frozenset[str]:
-    return frozenset((word.strip().casefold() for word in requests.get(url).text.splitlines()))
+    @staticmethod
+    @_load_or_calculate
+    def _combined_word_set(*word_sources: Iterable[str], ) -> frozenset[str]:
+        res = set()
+        res.update(*word_sources)
+        return frozenset(res)
 
+    def __init__(self, shelf_path: str | os.PathLike = SHELF_PATH, wordle_answers_url: str = WORDLE_ANSWERS_URL,
+                 wordle_allowed_guesses_url: str = WORDLE_ALLOWED_GUESSES_URL) -> None:
+        self.shelf: Optional[Shelf] = None
+        self.answer_url = wordle_answers_url
+        self.guess_url = wordle_allowed_guesses_url
+        self.shelf_path = shelf_path
 
-@_load_or_calculate
-def _all_word_set(*word_sources: Iterable[str], ) -> frozenset[str]:
-    res = set()
-    res.update(*word_sources)
-    return frozenset(res)
+    def __enter__(self):
+        self.shelf: Shelf = shelve.open(str(self.shelf_path))
+        return self
 
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if isinstance(self.shelf, Shelf):
+            self.shelf.close()
+        else:
+            logger.getChild(self.__class__.__exit__.__name__).error(
+                f"Five words exit method reached with no shelf open This probably means that the object is not being"
+                f" used as a context manager as it should.")
+        return False
 
-@_load_or_calculate
-def _heterogram_set(all_words: Iterable[str]) -> frozenset[str]:
-    return frozenset((word for word in all_words if len(word) == len(frozenset(word))))
+    def answer_words(self, force: bool = False) -> frozenset[str]:
+        return self._load_wordlist_url("answer_words", self.shelf, force, self.answer_url)
 
+    def guess_words(self, force: bool = False) -> frozenset[str]:
+        return self._load_wordlist_url("allowed_guess_words", self.shelf, force, self.guess_url)
 
-@_load_or_calculate
-def _anagram_map(heterogram_words: Iterable[str]) -> Anagram_Map[str]:
-    working_result: defaultdict[frozenset[str], set[str]] = defaultdict(set)
-    for word in heterogram_words:
-        working_result[frozenset(word)].add(word)
-    frozen_result = {k: frozenset(v) for k, v in working_result.items()}
-    return frozen_result
+    def all_words(self, force: bool = False) -> frozenset[str]:
+        return self._combined_word_set("all_words_set", self.shelf, force, self.answer_words(),
+                                       self.guess_words())
 
+    def heterogram_words(self, force: bool = False) -> frozenset[str]:
+        @_load_or_calculate
+        def _heterogram_set(all_words: Iterable[str]) -> frozenset[str]:
+            return frozenset((word for word in all_words if len(word) == len(frozenset(word))))
 
-def load_or_fetch_initial_data(shelf_path: Path = SHELF_PATH, answer_url: str = WORDLE_ANSWERS_URL,
-                               guess_url: str = WORDLE_ALLOWED_GUESSES_URL, force: bool = False) -> tuple[
-        frozenset[str], Anagram_Map[str]]:
-    shelf_path.parent.mkdir(parents=True, exist_ok=True)
-    with shelve.open(str(shelf_path)) as shelf:
-        answer_words = _load_wordlist_url("answer_words", shelf, force, answer_url)
-        guess_words = _load_wordlist_url("allowed_guess_words", shelf, force, guess_url)
-        all_words = _all_word_set("all_words_set", shelf, force, answer_words, guess_words)
-        heterogram_words = _heterogram_set("heterogram_set", shelf, force, all_words)
-        anagram_map = _anagram_map("anagram_map", shelf, force, heterogram_words)
-        return heterogram_words, anagram_map
+        return _heterogram_set("heterogram_set", self.shelf, force, self.all_words())
+
+    def anagram_map(self, force: bool = False) -> Anagram_Map[str]:
+        @_load_or_calculate
+        def _anagram_map(heterogram_words: Iterable[str]) -> Anagram_Map[str]:
+            working_result: defaultdict[frozenset[str], set[str]] = defaultdict(set)
+            for word in heterogram_words:
+                working_result[frozenset(word)].add(word)
+            frozen_result = {k: frozenset(v) for k, v in working_result.items()}
+            return frozen_result
+
+        return _anagram_map("anagram_map", self.shelf, force, self.heterogram_words())
 
 
 def _thread_init(anagram_map: Anagram_Map) -> None:
@@ -101,7 +125,7 @@ def _thread_init(anagram_map: Anagram_Map) -> None:
 
 def _two_word_map_func(
         item: tuple[frozenset[str], frozenset[str]]) -> dict[
-            frozenset[str], frozenset[frozenset[str]]]:
+    frozenset[str], frozenset[frozenset[str]]]:
     set_1, words_1 = item
     single_word_working_result = defaultdict(set)
     for set_2, words_2 in global_anagram_map.items():
@@ -128,7 +152,7 @@ def compute_two_word_sets(anagram_map: Mapping[frozenset[str], frozenset[str]]) 
 
 def compute_quadruple_words(
         double_word_map: Mapping[frozenset[str], frozenset[frozenset[str]]]) -> Mapping[
-            frozenset[str], frozenset[frozenset[str]]]:
+    frozenset[str], frozenset[frozenset[str]]]:
     working_result = defaultdict(set)
     for ((set_1, words_1), (set_2, words_2)) in product(double_word_map.items(), repeat=2):
         set_1: frozenset[str]
@@ -144,5 +168,5 @@ def compute_quadruple_words(
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.DEBUG)
-    words, anagrams = load_or_fetch_initial_data()
-    print(len(anagrams))
+    with FiveWords() as five_words_data:
+        test_map = five_words_data.anagram_map(force=True)
