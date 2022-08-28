@@ -56,7 +56,7 @@ class FiveWords:
     def _load_or_calculate(*, value_name: str) -> Callable[
         [Callable[Concatenate["FiveWords", P], R]], Callable[Concatenate["FiveWords", bool, P], R]]:
         def _load_or_calculate_decorator(func: Callable[Concatenate["FiveWords", P], R]) -> Callable[
-                Concatenate["FiveWords", bool, P], R]:
+            Concatenate["FiveWords", bool, P], R]:
             decorator_logger = logger.getChild(_load_or_calculate_decorator.__name__)
 
             @functools.wraps(func)
@@ -74,6 +74,12 @@ class FiveWords:
                     elapsed_time = end_time - start_time
                     self.shelf[times_value] = self.shelf.get(times_value, list()) + [elapsed_time]
                     wrapper_logger.info(f"{value_name} computed/retrieved in {elapsed_time} ns")
+                    if not hasattr(wrapper, "times_ns"):
+                        def retrieve_times() -> list[int]:
+                            return self.shelf[times_value]
+
+                        setattr(wrapper, "times_ns", retrieve_times)
+                        wrapper_logger.debug(f"Attaching {func.__name__}.times_ns()")
                 return self.shelf[value_name]
 
             return wrapper
@@ -175,4 +181,4 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.DEBUG)
     with FiveWords() as five_words_data:
         test_map = five_words_data.anagram_map(force=True)
-        print(len(test_map))
+        print(five_words_data.anagram_map.times_ns())
